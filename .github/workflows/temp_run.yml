@@ -1,0 +1,32 @@
+name: Temporary Scraper Run
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run-scraper:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install Dependencies & Build
+        run: |
+          npm install
+          npm run build
+
+      - name: Start Scraper and Expose Endpoint
+        run: |
+          # 1. Start the scraper app in the background
+          npm start &
+          
+          # 2. Wait 5 seconds for the app to boot up
+          sleep 5
+          
+          # 3. Create a clean public URL using Serveo (Stays live for the full 6 hours)
+          ssh -o StrictHostKeyChecking=no -R 80:localhost:3000 serveo.net
