@@ -22,9 +22,5 @@ jobs:
       - name: Deploy to Cloudflare Workers
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-        run: |
-          # Automatically claims a unique subdomain based on a random string if it hasn't been set up yet
-          npx wrangler subdomain anivault-api-dev19-${{ github.run_id }} || true
-          
-          # Runs the deployment smoothly
-          npx wrangler deploy src/index.ts --name anivault-api
+        # Bypasses interactive prompts by auto-provisioning a public worker subdomain route
+        run: npx wrangler deploy src/index.ts --name anivault-api --experimental-public-subdomain true
