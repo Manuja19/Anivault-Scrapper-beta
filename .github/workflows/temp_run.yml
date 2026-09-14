@@ -13,14 +13,18 @@ jobs:
       - name: Setup Node.js Environment
         uses: actions/setup-node@v4
         with:
-          node-version: 24 # Enforces clean, stable Node 24 runtime
+          node-version: 24
           cache: 'npm'
 
       - name: Install Dependencies
         run: npm install
 
       - name: Deploy to Cloudflare Workers
-        # Feeds the secret token right to the underlying wrangler engine natively
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-        run: npx wrangler deploy src/index.ts --name anivault-api
+        run: |
+          # Automatically claims a unique subdomain based on a random string if it hasn't been set up yet
+          npx wrangler subdomain anivault-api-dev19-${{ github.run_id }} || true
+          
+          # Runs the deployment smoothly
+          npx wrangler deploy src/index.ts --name anivault-api
