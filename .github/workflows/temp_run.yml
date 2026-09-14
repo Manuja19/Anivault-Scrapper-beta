@@ -1,41 +1,26 @@
-name: Temporary Scraper Run
+name: Deploy Cloudflare Worker
 
 on:
   workflow_dispatch:
 
 jobs:
-  run-scraper:
+  deploy:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Setup Node.js Environment
+      - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 24
+          node-version: 20
           cache: 'npm'
 
       - name: Install Dependencies
         run: npm install
 
-      - name: Start App and Expose Raw Endpoint
-        run: |
-          echo "🚀 Starting app matching Railway configurations..."
-          export PORT=8080
-          npm start &
-          
-          echo "⏳ Letting server bind..."
-          sleep 5
-          
-          echo "🔗 Launching Bore tunnel via Docker Container..."
-          # Uses Docker to route requests safely
-          docker run --init --net=host -d ekzhang/bore local 8080 --to bore.pub
-          
-          echo "⏳ Fetching tunnel address from Docker logs..."
-          sleep 3
-          docker logs $(docker ps -q -n 1)
-          
-          echo "🟢 Tunnel is up! Leaving container open to maintain endpoint connection..."
-          # Keeps the workflow alive for the full 6 hours
-          docker wait $(docker ps -q -n 1)
+      - name: Deploy to Cloudflare Workers
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          command: deploy src/index.ts --name anivault-api
