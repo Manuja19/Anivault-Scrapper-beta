@@ -1,7 +1,7 @@
 name: Temporary Scraper Run
 
 on:
-  workflow_dispatch:
+  workflow_dispatch: # Allows you to manually trigger it with a click
 
 jobs:
   run-scraper:
@@ -10,23 +10,27 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Setup Node.js
+      - name: Setup Node.js Environment
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 24  # Enforces Node.js 24 environment execution
+          cache: 'npm'
 
-      - name: Install Dependencies & Build
-        run: |
-          npm install
-          npm run build
+      - name: Install Dependencies
+        run: npm ci || npm install
 
-      - name: Start Scraper and Expose Endpoint
+      - name: Build TypeScript Code
+        run: npm run build --if-present
+
+      - name: Start App and Create Serveo Tunnel
         run: |
-          # 1. Start the scraper app in the background
-          npm start &
+          echo "🚀 Booting up the scraper in Node $(node -v) background..."
+          # Start the app natively (it will bind to port 5000)
+          npm start & 
           
-          # 2. Wait 5 seconds for the app to boot up
-          sleep 5
+          echo "⏳ Waiting 8 seconds for compilation and startup..."
+          sleep 8
           
-          # 3. Create a clean public URL using Serveo (Stays live for the full 6 hours)
-          ssh -o StrictHostKeyChecking=no -R 80:localhost:3000 serveo.net
+          echo "🔗 Connecting to Serveo to expose port 5000..."
+          # Creates a tunnel routing Serveo HTTP traffic straight to internal port 5000
+          ssh -o StrictHostKeyChecking=no -o ServerAliveInterval=30 -R 80:localhost:5000 serveo.net
