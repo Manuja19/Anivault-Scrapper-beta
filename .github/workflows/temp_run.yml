@@ -19,9 +19,6 @@ jobs:
       - name: Install Dependencies
         run: npm install
 
-      - name: Build TypeScript Code
-        run: npm run build
-
       - name: Start App and Expose Raw Endpoint
         run: |
           echo "🚀 Starting app matching Railway configurations..."
@@ -32,7 +29,7 @@ jobs:
           sleep 5
           
           echo "🔗 Launching Bore tunnel via Docker Container..."
-          # Uses Docker to completely bypass the extraction and tar download error
+          # Uses Docker to route requests safely
           docker run --init --net=host -d ekzhang/bore local 8080 --to bore.pub
           
           echo "⏳ Fetching tunnel address from Docker logs..."
