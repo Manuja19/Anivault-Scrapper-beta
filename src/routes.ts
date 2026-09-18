@@ -3,7 +3,7 @@ import { searchMal, resolveSiteIds } from './utils/mapper';
 import { cacheStats } from './utils/cache';
 
 import { getHeavenEpisodes, getHeavenServers, getHeavenStream, debugHeavenPage } from './scrapers/animeheaven';
-import { getAnikotoEpisodes, getAnikotoServers, getAnikotoEmbedUrl } from './scrapers/anikoto';
+import { searchAnikoto, findAnikotoSlug, getAnikotoEpisodes, getAnikotoServers, getAnikotoEmbedUrl } from './scrapers/anikoto';
 
 const app = new Hono();
 
@@ -176,118 +176,57 @@ async function watchHandler(c: any, source: string, id: string, ep: string, type
   if (isNaN(epNum)) return c.json({ error: 'ep must be a number' }, 400);
   if (!['sub', 'dub', 'raw'].includes(type)) return c.json({ error: 'type must be: sub, dub, raw' }, 400);
 
-  // ID convention for this path (site is MAL-first): a bare numeric ID or
-  // "mal-<id>" is a MAL ID (primary path, no AniList involved). "al-<id>"
-  // opts into the AniList fallback explicitly. Anything else non-numeric on
-  // animeheaven is treated as a literal AnimeHeaven slug.
   const forceAnilist = id.startsWith('al-');
   const explicitMal = id.startsWith('mal-');
   const bareNumeric = /^\d+$/.test(id);
   const directHeavenId = source === 'animeheaven' && !forceAnilist && !explicitMal && !bareNumeric;
+  const directAnikotoSlug = source === 'anikoto' && !forceAnilist && !explicitMal && !bareNumeric;
 
-  const anilistId = forceAnilist ? id.replace('al-', '') : undefined;
-  const malId = !forceAnilist && !directHeavenId ? (explicitMal ? id.replace('mal-', '') : id) : undefined;
+  let siteIds: any;
 
-  try {
-    const siteIds = directHeavenId
-      ? { anilistId: null, malId: null, title: null, siteIds: { animeheaven: id } }
-      : await resolveSiteIds(anilistId, malId);
-    if (!siteIds) return c.json({ error: 'Could not resolve anime' }, 404);
-
-    const epResult = await fetchEpisodes(source as Source, siteIds, { heavenId: heavenOverride || undefined });
-    if (epResult.error) return c.json({ error: epResult.error }, 404);
-
-    const episode = epResult.episodes.find((e: any) => Math.round(e.num) === epNum);
-    if (!episode) return c.json({ error: `Episode ${epNum} not found` }, 404);
-
-    let allServers: any[] = [];
-    if (source === 'animeheaven') allServers = await getHeavenServers(episode.id);
-    if (source === 'anikoto') allServers = await getAnikotoServers(episode.id);
-
-    const filtered = allServers.filter((s: any) => s.type === type);
-    if (!filtered.length) return c.json({ error: `No ${type} stream available on ${source} for ep ${epNum}` }, 404);
-
-    const strict = c.req.query('strict') === '1' || c.req.query('strict') === 'true';
-    let candidates = filtered;
-    if (preferredServer && strict) {
-      candidates = filtered.filter((s: any) => s.name.toLowerCase().includes(preferredServer.toLowerCase()));
-      if (!candidates.length) {
-        return c.json({ error: `No server matching "${preferredServer}" found`, availableServers: filtered.map((s: any) => s.name) }, 404);
-      }
-    } else if (preferredServer) {
-      candidates = [...filtered].sort((a: any, b: any) => {
-        const aM = a.name.toLowerCase().includes(preferredServer.toLowerCase()) ? -1 : 1;
-        const bM = b.name.toLowerCase().includes(preferredServer.toLowerCase()) ? -1 : 1;
-        return aM - bM;
+  if (directHeavenId) {
+    // Direct AnimeHeaven ID
+    siteIds = { anilistId: null, malId: null, title: null, siteIds: { animeheaven: id } };
+  } else if (directAnikotoSlug) {
+    // Direct Anikoto Slug (e.g., "one-piece")
+    siteIds = { anilistId: null, malId: null, title: id, siteIds: { anikoto: id } };
+  } else if (source === 'anikoto' && (forceAnilist || bareNumeric)) {
+    // AniList ID provided. Fetch title directly from AniList GraphQL, bypassing MAL entirely.
+    const alId = forceAnilist ? id.replace('al-', '') : id;
+    try {
+      const alRes = await fetch('https://graphql.anilist.co', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+        body: JSON.stringify({
+          query: `query($id: Int) { Media(id: $id) { title { romaji english } } }`,
+          variables: { id: parseInt(alId, 10) }
+        })
       });
-    }
+      const alData = await alRes.json();
+      const title = alData.data?.Media?.title?.english || alData.data?.Media?.title?.romaji;
+      
+      if (!title) return c.json({ error: 'Anime not found on AniList' }, 404);
 
-    let embedResult: any = null;
-    let usedServer = '';
-    for (const server of candidates) {
-      let raw: any = null;
-      if (source === 'animeheaven') raw = await getHeavenStream(server.sourceId);
-      if (source === 'anikoto') raw = await getAnikotoEmbedUrl(server.sourceId);
-      if (raw) { embedResult = raw; usedServer = server.name; break; }
-    }
-    if (!embedResult) {
-      const msg = strict && preferredServer ? `Server "${preferredServer}" failed to resolve a stream` : 'All servers failed';
-      return c.json({ error: msg, triedServers: candidates.map((s: any) => s.name) }, 502);
-    }
+      // Search Anikoto for this title to get the slug
+      const slug = await findAnikotoSlug(title);
+      if (!slug) return c.json({ error: `Could not find "${title}" on Anikoto` }, 404);
 
-    if (source === 'animeheaven') {
-      return c.json({
-        anilistId: siteIds.anilistId,
-        malId: siteIds.malId,
-        title: siteIds.title,
-        episode: epNum,
-        type,
-        source,
-        siteId: epResult.siteId,
-        server: usedServer,
-        availableServers: filtered.map((s: any) => s.name),
-        embedUrl: embedResult.embedUrl,
-        streamUrl: proxiedVideoUrl(c, embedResult.streamUrl),
-        rawStreamUrl: embedResult.streamUrl,
-        mp4: embedResult.mp4,
-        mp4ProxyUrl: proxiedVideoUrl(c, embedResult.mp4),
-        m3u8: null,
-        hlsProxyUrl: null,
-        playbackMode: 'mp4',
-        iframeOnly: false,
-        subtitles: [],
-        note: 'AnimeHeaven currently exposes direct MP4 sources, not m3u8/HLS.',
-      });
+      siteIds = { anilistId: parseInt(alId, 10), malId: null, title, siteIds: { anikoto: slug } };
+    } catch (e: any) {
+      return c.json({ error: 'Failed to fetch from AniList', detail: e?.message || String(e) }, 500);
     }
-
-    // anikoto is the only remaining non-animeheaven source at this point.
-    return c.json({
-      anilistId: siteIds.anilistId,
-      malId: siteIds.malId,
-      title: siteIds.title,
-      episode: epNum,
-      type,
-      source,
-      server: usedServer,
-      availableServers: filtered.map((s: any) => s.name),
-      embedUrl: embedResult.embedUrl,
-      m3u8: embedResult.m3u8 ?? null,
-      hlsProxyUrl: embedResult.m3u8 ? proxiedHlsUrl(c, embedResult.m3u8, embedResult.referer) : null,
-      playbackMode: embedResult.m3u8 ? 'hls' : 'iframe',
-      iframeOnly: !embedResult.m3u8,
-      subtitles: (embedResult.subtitles ?? []).map((s: any) => ({
-        ...s,
-        url: proxiedSubtitleUrl(c, s.url, embedResult.referer),
-      })),
-      intro: embedResult.intro || null,   // <-- USE ACTUAL INTRO
-      outro: embedResult.outro || null,   // <-- USE ACTUAL OUTRO
-      note: embedResult.m3u8 ? null : 'No m3u8 extracted — use embedUrl in an iframe.',
-    });
-  } catch (e) {
-    console.error(`[/watch/${source}]`, e);
-    return c.json({ error: 'Stream fetch failed', detail: String(e) }, 500);
+  } else {
+    // Fallback for other sources that might still use the mapper
+    const anilistId = forceAnilist ? id.replace('al-', '') : undefined;
+    const malId = explicitMal ? id.replace('mal-', '') : (bareNumeric ? id : undefined);
+    siteIds = await resolveSiteIds(anilistId, malId);
   }
-}
+
+  if (!siteIds) return c.json({ error: 'Could not resolve anime' }, 404);
+
+  // ... (Leave the rest of the watchHandler function exactly as it was below this point) ...
+  const epResult = await fetchEpisodes(source as Source, siteIds, { heavenId: heavenOverride || undefined });
+  // ...
 
 app.get('/watch', async (c) => {
   const anilistId = c.req.query('anilistId');
