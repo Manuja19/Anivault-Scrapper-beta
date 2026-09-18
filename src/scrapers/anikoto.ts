@@ -88,6 +88,8 @@ export interface AnikotoStream {
   subtitles: AnikotoSubtitle[];
   serverName: string;
   type: 'hls' | 'iframe';
+  intro?: { start: number; end: number } | null; // ADD THIS
+  outro?: { start: number; end: number } | null; // ADD THIS
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -582,57 +584,171 @@ async function doMegacloud(embedUrl: string, html: string, referer: string, serv
   }
 }
 
+// ── Web Crypto Helpers for Cloudflare Workers ──
+function base64UrlDecode(str: string): Uint8Array {
+  const base64 = str.replace(/-/g, '+').replace(/_/g, '/');
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
+function getScriptStrings(script: string): string[] {
+  const strings: string[] = [];
+  let index = 0;
+  while (index < script.length) {
+    const char = script[index];
+    if (char === "'" || char === '"') {
+      const quote = char;
+      let value = '';
+      index++;
+      while (index < script.length && script[index] !== quote) {
+        if (script[index] === '\\' && index + 1 < script.length) value += script[index++];
+        value += script[index++];
+      }
+      strings.push(value);
+      index++;
+    } else if (char === '`') {
+      index++;
+      while (index < script.length && script[index] !== '`') index += script[index] === '\\' ? 2 : 1;
+      index++;
+    } else {
+      index++;
+    }
+  }
+  return [...new Set(strings)];
+}
+
+async function decryptMegaPlaySource(encValue: string, script: string): Promise<string | null> {
+  const encrypted = base64UrlDecode(encValue);
+  if (!encrypted.length || encrypted.length % 16 !== 0) return null;
+  
+  const values = getScriptStrings(script).filter(s => s.length > 0 && s.length <= 32);
+  const ivs = values.filter(s => s.length === 16);
+  
+  for (const keyValue of values) {
+    const key = new Uint8Array(32);
+    const keyBytes = new TextEncoder().encode(keyValue);
+    key.set(keyBytes.slice(0, 32));
+    
+    for (const ivValue of ivs) {
+      try {
+        const iv = new TextEncoder().encode(ivValue);
+        const cryptoKey = await crypto.subtle.importKey('raw', key, { name: 'AES-CBC' }, false, ['decrypt']);
+        const decrypted = await crypto.subtle.decrypt({ name: 'AES-CBC', iv }, cryptoKey, encrypted);
+        const data = JSON.parse(new TextDecoder().decode(decrypted));
+        const source = data?.file || data?.url || data?.sources?.file || data?.sources?.[0]?.file;
+        if (typeof source === 'string' && source) return source;
+      } catch {
+        // Wrong key/IV, try next
+      }
+    }
+  }
+  return null;
+}
+
+function getMegaPlaySigningKey(script: string): string | null {
+  const directKeyMatch = script.match(/["']([a-zA-Z0-9+/=]{32,})["']/g);
+  if (directKeyMatch) {
+    for (const match of directKeyMatch) {
+      const key = match.slice(1, -1);
+      if (key.length >= 32 && key.length <= 64) return key;
+    }
+  }
+  return null;
+}
+
+async function signMegaPlayUrl(value: string, signingKey: string): Promise<string> {
+  if (/[?&]token=/i.test(value)) return value;
+  const match = value.match(/\/([a-f0-9]{32})\/([a-f0-9]{32})\//i);
+  if (!match) return value;
+  
+  const pathKey = `${match[1].toLowerCase()}/${match[2].toLowerCase()}`;
+  const payload = `${Math.floor(Date.now() / 1000) + 90}|${pathKey}`;
+  
+  const encoder = new TextEncoder();
+  const cryptoKey = await crypto.subtle.importKey('raw', encoder.encode(signingKey), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const signature = await crypto.subtle.sign('HMAC', cryptoKey, encoder.encode(payload));
+  const sigB64 = btoa(String.fromCharCode(...new Uint8Array(signature))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+  const token = `${btoa(payload).replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '')}.${sigB64}`;
+  
+  const endpoint = new URL(value);
+  endpoint.searchParams.set('token', token);
+  return endpoint.href;
+}
+
+async function getMegaplayScripts(host: string, html: string, referer: string) {
+  try {
+    const origin = `https://${host}/`;
+    const scriptUrls = [...html.matchAll(/<script[^>]+src=["']([^"']+)["']/gi)].map(m => new URL(m[1], origin).href);
+    const contents = await Promise.all(
+      scriptUrls.map(url => fetch(url, { headers: { 'User-Agent': UA, Referer: referer } }).then(r => r.text()).catch(() => null))
+    );
+    const script = contents.find(v => v && /getSources/i.test(v) && /AES/i.test(v)) || null;
+    const signingScript = contents.find(v => v && v.includes('[a-f0-9]{32}') && v.includes('token=')) || null;
+    return { script, signingKey: signingScript ? getMegaPlaySigningKey(signingScript) : null };
+  } catch {
+    return { script: null, signingKey: null };
+  }
+}
+
 // ── Megaplay (megaplay.buzz / vidwish.live / vidtube.site mirrors) ──
 async function doMegaplay(host: string, html: string, referer: string, serverName: string): Promise<AnikotoStream | null> {
-  const match = html.match(/<title>File ([0-9]+)/);
-  if (!match) {
-    log('megaplay: no "<title>File N" match — page may not be a megaplay player', { host, htmlSnippet: html.slice(0, 300) });
-    return null;
-  }
+  const match = html.match(/<title>File(\d+)/);
+  if (!match) return null;
   const id = match[1];
 
   try {
-    const { data } = await axios.get(`https://${host}/stream/getSources?id=${id}`, {
+    const res = await axios.get(`https://${host}/stream/getSources?id=${id}`, {
       headers: { ...DEFAULT_HEADERS, 'X-Requested-With': 'XMLHttpRequest', Referer: referer },
       timeout: 8000,
     });
+    const data = res.data;
 
     let m3u8: string | undefined = data?.sources?.file;
     const subtitles: AnikotoSubtitle[] = (data?.tracks || [])
       .filter((t: any) => t?.file)
       .map((t: any) => ({ url: t.file, lang: t.label ?? 'Unknown', default: Boolean(t.default) }));
 
-    if (m3u8 && m3u8.includes('mewstream.buzz')) {
-      const original = m3u8;
-      let replacementHost = '1oe.lostproject.club';
-      let source: 'subtitle-derived' | 'hardcoded-fallback' = 'hardcoded-fallback';
-      const firstTrack = subtitles.find((t) => t.url && !t.url.includes('mewstream.buzz'));
-      if (firstTrack) {
-        try {
-          replacementHost = new URL(firstTrack.url).host;
-          source = 'subtitle-derived';
-        } catch {
-          // keep default fallback host
+    // Decrypt 'enc' blob if plaintext m3u8 is missing
+    if (!m3u8 && data?.enc) {
+      const { script, signingKey } = await getMegaplayScripts(host, html, referer);
+      if (script) {
+        const decrypted = await decryptMegaPlaySource(data.enc, script);
+        if (decrypted) {
+          m3u8 = signingKey ? await signMegaPlayUrl(decrypted, signingKey) : decrypted;
         }
+      }
+    }
+
+    // Rewrite mewstream.buzz host if present
+    if (m3u8 && m3u8.includes('mewstream.buzz')) {
+      const firstTrack = subtitles.find(t => t.url && !t.url.includes('mewstream.buzz'));
+      let replacementHost = '1oe.lostproject.club';
+      if (firstTrack) {
+        try { replacementHost = new URL(firstTrack.url).host; } catch {}
       }
       try {
         const parsed = new URL(m3u8);
         parsed.host = replacementHost;
         m3u8 = parsed.toString();
-        log('megaplay: rewrote mewstream.buzz host', { host, id, original, rewritten: m3u8, replacementHost, source });
-      } catch (err) {
-        log('megaplay: mewstream.buzz host rewrite failed, keeping original (likely dead) url', { host, id, original, ...errInfo(err) });
-      }
+      } catch {}
     }
 
-    if (!m3u8) {
-      log('megaplay: getSources returned no sources.file', { host, id, data });
-      return null;
-    }
-    log('megaplay: resolved', { host, id, m3u8 });
-    return { embedUrl: `https://${host}/`, m3u8, referer, subtitles, serverName, type: 'hls' };
+    if (!m3u8) return null;
+
+    return {
+      embedUrl: `https://${host}/`,
+      m3u8,
+      referer,
+      subtitles,
+      intro: data.intro || null,   // <-- CAPTURE INTRO
+      outro: data.outro || null,   // <-- CAPTURE OUTRO
+      serverName,
+      type: 'hls'
+    };
   } catch (err) {
-    log('megaplay: getSources threw', { host, id, ...errInfo(err) });
+    log('megaplay: getSources threw', errInfo(err));
     return null;
   }
 }
