@@ -279,8 +279,8 @@ async function watchHandler(c: any, source: string, id: string, ep: string, type
         ...s,
         url: proxiedSubtitleUrl(c, s.url, embedResult.referer),
       })),
-      intro: null,
-      outro: null,
+      intro: embedResult.intro || null,   // <-- USE ACTUAL INTRO
+      outro: embedResult.outro || null,   // <-- USE ACTUAL OUTRO
       note: embedResult.m3u8 ? null : 'No m3u8 extracted — use embedUrl in an iframe.',
     });
   } catch (e) {
